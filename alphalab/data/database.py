@@ -1,141 +1,60 @@
-from __future__ import annotations
+import datetime
+from pathlib import Path
+from typing import Literal
 
-import datetime as dt
-import logging
-import duckdb
 import pandas as pd
-import re
-from typing import Any, List, Optional, Union
 
-LOGGER = logging.getLogger("update_duckdb")
+from .base import DuckDBBase
 
-class FactorDuckDB():
-    def __init__(self, db_path=None):
-        """
-        基于 DuckDB 的因子数据库，所有表共享同一套 (date, code) 索引（仅包含在市的股票）
-        
-        db_path: str | Path
-            DuckDB 数据库文件路径
-        """
-        self.db_path = str(db_path)
-        self.con = duckdb.connect(self.db_path)
-        self._known_tables = set()
-    
 
-    @staticmethod
-    def _quote_identifier(identifier: str) -> str:
-        """
-        安全引用 SQL 标识符（表名、列名）
-        将双引号转义为两个双引号，并用双引号包裹
+WriteMode = Literal["replace_table", "upsert", "replace_columns"]
 
-        identifier: str
-        """
-        return f'"{identifier.replace('"', '""')}"'
-    
+
+class FactorDuckDB(DuckDBBase):
+    """DuckDB-backed factor database.
+
+    ``Universe`` is the canonical ``(date, code)`` key table. Factor tables
+    should contain exactly the same ``(date, code)`` rows as ``Universe``.
+    """
+
+    key_cols = ("date", "code")
+    universe_table = "Universe"
+    dictionary_table = "factor_dictionary"
+
+    def __init__(self, db_path: str | Path | None = None, *, read_only: bool = False):
+        """Open a DuckDB factor database."""
+        super().__init__(db_path, read_only=read_only)
 
     @staticmethod
-    def _validate_identifier(identifier: str) -> bool:
-        """
-        验证标识符是否合法（仅包含字母、数字、下划线，可选中文）
-        可根据需要调整正则表达式
-        """
-        return bool(re.fullmatch(r'[A-Za-z0-9_\u4e00-\u9fff]+', identifier))
-    
+    def _normalize_date_code(frame: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy with normalized ``date`` and ``code`` columns."""
+        df = frame.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["code"] = df["code"].astype(str)
+        return df
 
-    def _table_exists(self, table_name: str) -> bool:
-        """
-        检查表是否存在
-        """
-        if table_name in self._known_tables:
-            return True
-        result = self.con.execute(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
-            [table_name],
-        ).fetchone()[0]
-        exists = result > 0
-        if exists:
-            self._known_tables.add(table_name)
-        return exists
+    @staticmethod
+    def infer_sql_type(series: pd.Series) -> str:
+        """Infer a DuckDB SQL type from a pandas Series."""
+        sample = series.dropna()
 
+        if sample.empty:
+            return "DOUBLE"
+        if pd.api.types.is_bool_dtype(sample):
+            return "BOOLEAN"
+        if pd.api.types.is_integer_dtype(sample):
+            return "BIGINT"
+        if pd.api.types.is_float_dtype(sample):
+            return "DOUBLE"
+        if pd.api.types.is_datetime64_any_dtype(sample):
+            return "TIMESTAMP"
 
-    def _insert_universe_rows_into_table(self, table_name: str) -> None:
-        """
-        将 universe 中缺失的主键行插入到指定表中 (ON CONFLICT 忽略已存在)
-        """
-        table = self._quote_identifier(table_name)
-        self.con.execute(
-            f"""
-            INSERT INTO {table} (date, code)
-            SELECT date, code FROM universe
-            ON CONFLICT (date, code) DO NOTHING
-            """
-        )
-    
-    
-    def update_universe(self, frame: pd.DataFrame) -> None:
-        """
-        更新股票池/公共索引表 (date, code)
-        通常为交易日以及相应的在市股票代码 
-        """
-        if not {"date", "code"}.issubset(frame.columns):
-            LOGGER.error("更新 universe 失败：输入缺少 'date' 或 'code' 列")
-            return
-        
-        df_universe = frame[["date", "code"]].copy()
-        df_universe["date"] = pd.to_datetime(df_universe["date"]).dt.date
+        return "VARCHAR"
 
-        self.con.register("_tmp_universe", df_universe)
-        try:
-            self.con.execute("CREATE OR REPLACE TABLE universe AS SELECT date, code FROM _tmp_universe")
-        finally:
-            self.con.unregister("_tmp_universe")
-        
-        LOGGER.info(f"更新股票池完成，共 {len(df_universe)} 条记录")
-
-        # 可选：自动同步所有现有因子表（若需要立即生效，取消下面注释）
-        # self.sync_all_tables()
-
-
-    def load_universe(self, date: Union[dt.date, str]) -> List[str]:
-        """
-        获取指定日期的股票代码列表
-        """
-        res = self.con.execute(
-            "SELECT code FROM universe WHERE date = ?", 
-            [date]
-        ).fetchall()
-        return [r[0] for r in res]
-    
-
-    def sync_table_universe(self, table_name: str) -> None:
-        """
-        将指定表与当前 universe 同步（插入缺失的主键行）
-        """
-        if not self._table_exists(table_name):
-            LOGGER.warning(f"表 {table_name} 不存在，无法同步")
-            return
-        self._insert_universe_rows_into_table(table_name)
-        LOGGER.debug(f"表 {table_name} 已与 universe 同步")
-
-
-    def sync_all_tables(self) -> None:
-        """
-        同步所有因子表与当前 universe
-        """
-        tables = self.list_tables()
-        for tbl in tables:
-            if tbl == "universe":
-                continue
-            self.sync_table_universe(tbl)
-        LOGGER.info(f"已同步 {len(tables)-1} 个表")
-    
-
-    def create_table(self, table_name: str) -> None:
-        """
-        创建因子表（如果不存在），包含主键 (date, code)，并插入所有 universe 主键行
-        """
-        table = self._quote_identifier(table_name)
-        self.con.execute(
+    def create_universe_table(self) -> None:
+        """Create ``Universe`` if it does not exist."""
+        table = self.quote_identifier(self.universe_table)
+        self.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {table} (
                 date DATE NOT NULL,
@@ -144,304 +63,666 @@ class FactorDuckDB():
             )
             """
         )
-        self._known_tables.add(table_name)
-        # 插入当前 universe 的所有行
-        self._insert_universe_rows_into_table(table_name)
-        LOGGER.debug(f"表 {table_name} 已创建，主键行与 universe 同步")
 
-
-    def ensure_factor_column(
-        self, 
-        table_name: str, 
-        factor_name: str, 
-        sql_type: str, 
-        drop_if_type_mismatch: bool = False
+    def update_universe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        replace: bool = True,
+        sync_factor_tables: bool = True,
     ) -> None:
-        """
-        确保表中存在指定因子列，若类型不匹配则根据参数决定是否重建列
-        """
-        if not self._validate_identifier(factor_name):
-            raise ValueError(f"非法因子名: {factor_name}")
-
-        # 确保表存在且包含主键行
-        if not self._table_exists(table_name):
-            self.create_table(table_name)
-        else:
-            # 表存在但可能缺少部分 universe 行
-            self._insert_universe_rows_into_table(table_name)
-
-        # 检查列是否存在及其类型
-        current_type = self.con.execute(
-            """
-            SELECT data_type
-            FROM information_schema.columns
-            WHERE table_name = ? AND column_name = ?
-            """,
-            [table_name, factor_name],
-        ).fetchone()
-
-        if current_type:
-            if current_type[0] != sql_type:
-                msg = f"列 {table_name}.{factor_name} 类型不匹配: 当前 {current_type[0]}, 期望 {sql_type}"
-                if drop_if_type_mismatch:
-                    LOGGER.warning(msg + "，将删除原列并重建")
-                    self.drop_factor_column(table_name, factor_name)
-                else:
-                    LOGGER.warning(msg + "，未执行任何操作")
-                    return
-            else:
-                LOGGER.debug(f"列 {table_name}.{factor_name} 已存在且类型匹配")
-                return
-
-        # 添加新列
-        table = self._quote_identifier(table_name)
-        col = self._quote_identifier(factor_name)
-        self.con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {sql_type}")
-
-
-    def drop_table(self, table_name: str, if_exists: str = "fail") -> None:
-        """
-        删除整张因子表
-
-        if_exists : str, {'fail', 'ignore'}
-            - 'fail'   : 表不存在时抛出异常
-            - 'ignore' : 表不存在时不作任何操作
-        """
-        if not self._validate_identifier(table_name):
-            raise ValueError(f"非法表名: {table_name}")
-
-        exists = self._table_exists(table_name)
-        if not exists and if_exists == "fail":
-            raise RuntimeError(f"表 {table_name} 不存在，无法删除")
-
-        if exists:
-            table = self._quote_identifier(table_name)
-            self.con.execute(f"DROP TABLE {table}")
-            self._known_tables.discard(table_name)
-            LOGGER.info(f"已删除表 {table_name}")
-        else:
-            LOGGER.debug(f"表 {table_name} 不存在，忽略")
-
-
-    def drop_factor_column(self, table_name: str, factor_name: str) -> None:
-        """
-        删除因子列
-        """
-        if not self._validate_identifier(factor_name):
-            raise ValueError(f"非法因子名: {factor_name}")
-        table = self._quote_identifier(table_name)
-        col = self._quote_identifier(factor_name)
-        self.con.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
-        LOGGER.debug(f"已删除列 {table_name}.{factor_name}")
-    
-
-    def rename_factor_column(self, table_name: str, old_name: str, new_name: str) -> None:
-        """
-        重命名因子列
-        """
-        for name in (old_name, new_name):
-            if not self._validate_identifier(name):
-                raise ValueError(f"非法因子名: {name}")
-        table = self._quote_identifier(table_name)
-        old = self._quote_identifier(old_name)
-        new = self._quote_identifier(new_name)
-        self.con.execute(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
-        LOGGER.debug(f"列 {table_name}.{old_name} 重命名为 {new_name}")
-    
-
-    def clear_factor(self, table_name: str, factor_name: str) -> None:
-        """
-        将因子列的所有值设为 NULL
-        """
-        if not self._validate_identifier(factor_name):
-            raise ValueError(f"非法因子名: {factor_name}")
-        table = self._quote_identifier(table_name)
-        col = self._quote_identifier(factor_name)
-        self.con.execute(f'UPDATE {table} SET {col} = NULL')
-        LOGGER.debug(f"已清空列 {table_name}.{factor_name}")
-    
-
-    def list_tables(self) -> List[str]:
-        """
-        返回所有用户表名（不包括系统表）
-        """
-        rows = self.con.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()
-        tables = [r[0] for r in rows]
-        self._known_tables.update(tables)
-        return tables
-    
-
-    def list_factors(self, table_name: str) -> List[str]:
-        """获取因子表中除 date, code 外的所有列名"""
-        if not self._table_exists(table_name):
-            return []
-        rows = self.con.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = ?
-            ORDER BY ordinal_position
-            """,
-            [table_name],
-        ).fetchall()
-        return [r[0] for r in rows if r[0] not in ("date", "code")]
-
-
-    def write_factor_frame(self, table_name, factor_name, frame, sql_type=None, replace=False):
-        """
-        将因子数据写入数据库，支持宽表和长表两种格式。
-
-        宽表格式: index 为日期, columns 为股票代码，值为因子值
-        长表格式：必须包含 'date', 'code', factor_name 三列
+        """Update ``Universe``.
 
         Parameters
         ----------
-        table_name : str
-            目标表名
-        factor_name : str
-            因子列名
-        frame : pd.DataFrame
-            因子数据（宽表或长表）
+        frame:
+            DataFrame containing ``date`` and ``code`` columns.
+        replace:
+            If true, rebuild ``Universe`` from ``frame``. If false, append
+            missing rows.
+        sync_factor_tables:
+            If true, align existing factor tables to the updated ``Universe``.
+        """
+        if not {"date", "code"}.issubset(frame.columns):
+            raise ValueError("frame must contain 'date' and 'code' columns")
+
+        df = self._normalize_date_code(frame[["date", "code"]])
+        table = self.quote_identifier(self.universe_table)
+
+        with self.registered("_tmp_Universe", df):
+            if replace:
+                self.execute(f"DROP TABLE IF EXISTS {table}")
+                self.execute(
+                    f"""
+                    CREATE TABLE {table} (
+                        date DATE NOT NULL,
+                        code VARCHAR NOT NULL,
+                        PRIMARY KEY (date, code)
+                    )
+                    """
+                )
+                self.execute(
+                    f"""
+                    INSERT INTO {table} (date, code)
+                    SELECT DISTINCT date, code
+                    FROM _tmp_Universe
+                    """
+                )
+            else:
+                self.create_universe_table()
+                self.execute(
+                    f"""
+                    INSERT INTO {table} (date, code)
+                    SELECT DISTINCT date, code
+                    FROM _tmp_Universe
+                    ON CONFLICT (date, code) DO NOTHING
+                    """
+                )
+
+        if sync_factor_tables:
+            self.sync_all_factor_tables()
+
+    def load_universe(self, date: str | datetime.date | pd.Timestamp) -> list[str]:
+        """Return all codes in ``Universe`` on a given date."""
+        date = pd.to_datetime(date).date()
+        table = self.quote_identifier(self.universe_table)
+
+        rows = self.execute(
+            f"""
+            SELECT code
+            FROM {table}
+            WHERE date = ?
+            ORDER BY code
+            """,
+            [date],
+        ).fetchall()
+
+        return [row[0] for row in rows]
+
+    def create_factor_table(
+        self,
+        table_name: str,
+        *,
+        sync_universe: bool = True,
+    ) -> None:
+        """Create a factor table and optionally align it to ``Universe``."""
+        table = self.quote_identifier(table_name)
+
+        self.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                date DATE NOT NULL,
+                code VARCHAR NOT NULL,
+                PRIMARY KEY (date, code)
+            )
+            """
+        )
+
+        if sync_universe:
+            self.sync_table_universe(table_name)
+
+    def sync_table_universe(self, table_name: str) -> None:
+        """Make a factor table's ``(date, code)`` rows exactly match ``Universe``.
+
+        Rows outside ``Universe`` are deleted. Missing ``Universe`` rows are
+        inserted with NULL factor values.
+        """
+        if table_name == self.universe_table:
+            return
+        if not self.table_exists(self.universe_table):
+            raise RuntimeError("Universe table does not exist")
+
+        table = self.quote_identifier(table_name)
+        universe_table = self.quote_identifier(self.universe_table)
+
+        self.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                date DATE NOT NULL,
+                code VARCHAR NOT NULL,
+                PRIMARY KEY (date, code)
+            )
+            """
+        )
+        self.execute(
+            f"""
+            DELETE FROM {table} AS t
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {universe_table} AS u
+                WHERE u.date = t.date
+                  AND u.code = t.code
+            )
+            """
+        )
+        self.execute(
+            f"""
+            INSERT INTO {table} (date, code)
+            SELECT date, code
+            FROM {universe_table}
+            ON CONFLICT (date, code) DO NOTHING
+            """
+        )
+
+    def sync_all_factor_tables(self) -> None:
+        """Align every factor table to ``Universe``."""
+        if not self.table_exists(self.universe_table):
+            return
+
+        skip_tables = {self.universe_table, self.dictionary_table}
+        for table_name in self.list_tables():
+            if table_name not in skip_tables:
+                self.sync_table_universe(table_name)
+
+    def list_factors(self, table_name: str) -> list[str]:
+        """List factor columns in a factor table."""
+        if not self.table_exists(table_name):
+            return []
+
+        return [
+            col
+            for col in self.list_columns(table_name)
+            if col not in self.key_cols
+        ]
+
+    def ensure_columns(
+        self,
+        table_name: str,
+        dtypes: dict[str, str],
+        *,
+        drop_if_type_mismatch: bool = False,
+        sync_universe: bool = True,
+    ) -> None:
+        """Ensure factor columns exist with the expected SQL types."""
+        self.create_factor_table(table_name, sync_universe=sync_universe)
+        table = self.quote_identifier(table_name)
+
+        for col_name, sql_type in dtypes.items():
+            current_type = self.column_type(table_name, col_name)
+            col = self.quote_identifier(col_name)
+
+            if current_type is None:
+                self.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
+                continue
+
+            if current_type != sql_type:
+                if not drop_if_type_mismatch:
+                    raise TypeError(
+                        f"{table_name}.{col_name} type mismatch: "
+                        f"current={current_type}, expected={sql_type}"
+                    )
+                self.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+                self.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
+
+    def drop_factor(
+        self,
+        table_name: str,
+        factor_name: str,
+        *,
+        if_exists: bool = True,
+    ) -> None:
+        """Drop a factor column."""
+        table = self.quote_identifier(table_name)
+        col = self.quote_identifier(factor_name)
+        exists_sql = "IF EXISTS " if if_exists else ""
+        self.execute(f"ALTER TABLE {table} DROP COLUMN {exists_sql}{col}")
+
+    def rename_factor(self, table_name: str, old_name: str, new_name: str) -> None:
+        """Rename a factor column."""
+        table = self.quote_identifier(table_name)
+        old = self.quote_identifier(old_name)
+        new = self.quote_identifier(new_name)
+        self.execute(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
+
+    def clear_factor(
+        self,
+        table_name: str,
+        factor_name: str,
+        *,
+        start_date: str | datetime.date | None = None,
+        end_date: str | datetime.date | None = None,
+    ) -> None:
+        """Set a factor column to NULL, optionally within a date range."""
+        table = self.quote_identifier(table_name)
+        col = self.quote_identifier(factor_name)
+
+        clauses = []
+        params = []
+        if start_date is not None:
+            clauses.append("date >= ?")
+            params.append(pd.to_datetime(start_date).date())
+        if end_date is not None:
+            clauses.append("date <= ?")
+            params.append(pd.to_datetime(end_date).date())
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        self.execute(f"UPDATE {table} SET {col} = NULL {where_sql}", params)
+
+    def _coerce_factor_frame(
+        self,
+        frame: pd.DataFrame | pd.Series,
+        *,
+        factor_name: str | None,
+    ) -> pd.DataFrame:
+        """Normalize supported factor inputs to long form."""
+        if isinstance(frame, pd.Series):
+            name = factor_name or frame.name
+            if name is None:
+                raise ValueError("factor_name is required for an unnamed Series")
+
+            df = frame.rename(name).reset_index()
+            if df.shape[1] != 3:
+                raise ValueError("Series input must have a two-level index: date, code")
+            df.columns = ["date", "code", name]
+            return df
+
+        if {"date", "code"}.issubset(frame.columns):
+            df = frame.copy()
+            if factor_name is not None:
+                if factor_name not in df.columns:
+                    raise ValueError(f"frame does not contain {factor_name!r}")
+                df = df[["date", "code", factor_name]]
+            return df
+
+        if factor_name is None:
+            raise ValueError("factor_name is required for a wide DataFrame")
+
+        return (
+            frame.copy()
+            .rename_axis(index="date")
+            .reset_index()
+            .melt(id_vars="date", var_name="code", value_name=factor_name)
+        )
+
+    def write_factor_table(
+        self,
+        table_name: str,
+        frame: pd.DataFrame | pd.Series,
+        *,
+        factor_name: str | None = None,
+        dtypes: dict[str, str] | None = None,
+        mode: WriteMode = "replace_table",
+        drop_if_type_mismatch: bool = False,
+        sync_universe: bool = True,
+    ) -> None:
+        """Write factor data to a factor table.
+
+        Supported input:
+        - long DataFrame: ``date``, ``code``, factor columns
+        - wide DataFrame: index is date, columns are codes, one factor
+        - Series with two-level index: date and code
+
+        With ``sync_universe=True``, writes are restricted to ``Universe`` and
+        the target table is aligned to ``Universe`` after writing.
         """
         if frame.empty:
             return
-        
-        # 确保目标表存在且包含所有 universe 主键行
-        self.create_table(table_name)
 
-        # 检测输入格式：若存在 'date' 和 'code' 列则视为长表，否则视为宽表
-        if {"date", "code"}.issubset(frame.columns):
-            df_long = frame[["date", "code", factor_name]].copy()
-        else:
-            # 宽表格式：index 为日期，columns 为股票代码
-            df_long = frame.stack().reset_index()
-            df_long.columns = ["date", "code", factor_name]
+        df = self._coerce_factor_frame(frame, factor_name=factor_name)
+        if not {"date", "code"}.issubset(df.columns):
+            raise ValueError("input must contain or resolve to date/code columns")
 
-        df_long["date"] = pd.to_datetime(df_long["date"]).dt.date
-        df_long = df_long[df_long[factor_name].notna()]
-        if df_long.empty:
+        df = self._normalize_date_code(df)
+        factor_cols = [col for col in df.columns if col not in self.key_cols]
+        if not factor_cols:
+            raise ValueError("no factor columns found")
+
+        df = df.drop_duplicates(["date", "code"], keep="last")
+        col_types = {
+            col: (dtypes or {}).get(col, self.infer_sql_type(df[col]))
+            for col in factor_cols
+        }
+        df = df[["date", "code", *factor_cols]]
+
+        if mode == "replace_table":
+            self._replace_factor_table(
+                table_name,
+                df,
+                col_types,
+                sync_universe=sync_universe,
+            )
             return
-        
-        # 自动推断 SQL 类型（如果未提供）
-        if sql_type is None:
-            sample = df_long[factor_name].dropna()
-            if not sample.empty:
-                val = sample.iloc[0]
-                if isinstance(val, str) or pd.api.types.is_string_dtype(sample):
-                    sql_type = "VARCHAR"
-                else:
-                    sql_type = "DOUBLE"
-            else:
-                sql_type = "DOUBLE"
 
-        # 若需要替换列，先删除已存在的列（如果存在）
-        if replace and self._table_exists(table_name):
-            current_type = self.con.execute(
-                """
-                SELECT data_type
-                FROM information_schema.columns
-                WHERE table_name = ? AND column_name = ?
-                """,
-                [table_name, factor_name],
-            ).fetchone()
-            if current_type:
-                self.drop_factor_column(table_name, factor_name)
+        self.create_factor_table(table_name, sync_universe=sync_universe)
 
-        # 确保因子列存在（若类型不匹配会重建列）
-        self.ensure_factor_column(table_name, factor_name, sql_type)
+        if mode == "replace_columns":
+            for col in factor_cols:
+                if self.column_type(table_name, col) is not None:
+                    self.drop_factor(table_name, col, if_exists=True)
 
-        # 注册临时表并写入
-        self.con.register("_tmp_factor", df_long)
-        table = self._quote_identifier(table_name)
-        col = self._quote_identifier(factor_name)
-        try:
-            self.con.execute(
+        self.ensure_columns(
+            table_name,
+            col_types,
+            drop_if_type_mismatch=drop_if_type_mismatch,
+            sync_universe=sync_universe,
+        )
+        self._upsert_factor_rows(
+            table_name,
+            df,
+            factor_cols,
+            sync_universe=sync_universe,
+        )
+
+    def _replace_factor_table(
+        self,
+        table_name: str,
+        frame: pd.DataFrame,
+        dtypes: dict[str, str],
+        *,
+        sync_universe: bool = True,
+    ) -> None:
+        """Drop and rebuild a factor table.
+
+        If ``sync_universe`` is true, the rebuilt table uses ``Universe`` as
+        the driving table. Input keys outside ``Universe`` are ignored and
+        missing factor values become NULL.
+        """
+        table = self.quote_identifier(table_name)
+        factor_cols = [col for col in frame.columns if col not in self.key_cols]
+        quoted_factor_cols = self.quote_identifiers(factor_cols)
+        column_defs = [
+            "date DATE NOT NULL",
+            "code VARCHAR NOT NULL",
+            *[
+                f"{self.quote_identifier(col)} {dtypes[col]}"
+                for col in factor_cols
+            ],
+            "PRIMARY KEY (date, code)",
+        ]
+
+        with self.registered("_tmp_factors", frame):
+            self.execute(f"DROP TABLE IF EXISTS {table}")
+            self.execute(
                 f"""
-                INSERT INTO {table} (date, code, {col})
-                SELECT date, code, {col}
-                FROM _tmp_factor
-                ON CONFLICT (date, code) DO UPDATE SET {col} = EXCLUDED.{col}
+                CREATE TABLE {table} (
+                    {", ".join(column_defs)}
+                )
                 """
             )
-            LOGGER.debug(f"因子 {factor_name} 写入完成，共 {len(df_long)} 条有效记录")
-        except Exception as e:
-            LOGGER.error(f"写入因子 {factor_name} 失败: {e}")
-            raise
-        finally:
-            self.con.unregister("_tmp_factor")
 
+            if sync_universe:
+                if not self.table_exists(self.universe_table):
+                    raise RuntimeError("Universe table does not exist")
+
+                universe_table = self.quote_identifier(self.universe_table)
+                insert_cols = ["date", "code", *quoted_factor_cols]
+                select_cols = [
+                    "u.date",
+                    "u.code",
+                    *[f"src.{col}" for col in quoted_factor_cols],
+                ]
+                self.execute(
+                    f"""
+                    INSERT INTO {table} ({", ".join(insert_cols)})
+                    SELECT {", ".join(select_cols)}
+                    FROM {universe_table} AS u
+                    LEFT JOIN _tmp_factors AS src
+                        ON src.date = u.date
+                       AND src.code = u.code
+                    """
+                )
+            else:
+                insert_cols = ["date", "code", *quoted_factor_cols]
+                cols_sql = ", ".join(insert_cols)
+                self.execute(
+                    f"""
+                    INSERT INTO {table} ({cols_sql})
+                    SELECT {cols_sql}
+                    FROM _tmp_factors
+                    """
+                )
+
+    def _upsert_factor_rows(
+        self,
+        table_name: str,
+        frame: pd.DataFrame,
+        factor_cols: list[str],
+        *,
+        sync_universe: bool = True,
+    ) -> None:
+        """Upsert factor values, optionally filtering source rows by ``Universe``."""
+        table = self.quote_identifier(table_name)
+        quoted_factor_cols = self.quote_identifiers(factor_cols)
+        insert_cols = ["date", "code", *quoted_factor_cols]
+        update_sql = ", ".join(
+            f"{col} = EXCLUDED.{col}"
+            for col in quoted_factor_cols
+        )
+
+        with self.registered("_tmp_factors", frame):
+            if sync_universe:
+                if not self.table_exists(self.universe_table):
+                    raise RuntimeError("Universe table does not exist")
+
+                universe_table = self.quote_identifier(self.universe_table)
+                select_cols = ", ".join(f"src.{col}" for col in insert_cols)
+                source_sql = f"""
+                    SELECT {select_cols}
+                    FROM _tmp_factors AS src
+                    INNER JOIN {universe_table} AS u
+                        ON src.date = u.date
+                       AND src.code = u.code
+                """
+            else:
+                cols_sql = ", ".join(insert_cols)
+                source_sql = f"""
+                    SELECT {cols_sql}
+                    FROM _tmp_factors
+                """
+
+            self.execute(
+                f"""
+                INSERT INTO {table} ({", ".join(insert_cols)})
+                {source_sql}
+                ON CONFLICT (date, code) DO UPDATE SET {update_sql}
+                """
+            )
+
+        if sync_universe:
+            self.sync_table_universe(table_name)
+
+    def write_factor(
+        self,
+        table_name: str,
+        factor_name: str,
+        frame: pd.DataFrame | pd.Series,
+        **kwargs,
+    ) -> None:
+        """Compatibility wrapper for writing one factor."""
+        self.write_factor_table(
+            table_name,
+            frame,
+            factor_name=factor_name,
+            **kwargs,
+        )
+
+    def write_factors(self, table_name: str, frame: pd.DataFrame, **kwargs) -> None:
+        """Compatibility wrapper for writing one or more factors."""
+        self.write_factor_table(table_name, frame, **kwargs)
 
     def query(
         self,
         table_name: str,
-        factors: list[str] | str | None = None,
-        codes: list[str] | str | None = None,
-        start_date: str | dt.date | None = None,
-        end_date: str | dt.date | None = None,
+        factors: str | list[str] | None = None,
+        codes: str | list[str] | None = None,
+        start_date: str | datetime.date | None = None,
+        end_date: str | datetime.date | None = None,
+        *,
+        drop_all_null: bool = False,
         limit: int | None = None,
     ) -> pd.DataFrame:
-        """查询指定表的数据，自动过滤不在市的股票"""
+        """Query factor data in long form."""
+        if not self.table_exists(table_name):
+            raise RuntimeError(f"table does not exist: {table_name}")
+
         factor_cols = [factors] if isinstance(factors, str) else factors
-        columns = ["date", "code"] + (factor_cols or self.factor_columns(table_name))
+        factor_cols = factor_cols or self.list_factors(table_name)
+        columns = ["date", "code", *factor_cols]
+        select_sql = ", ".join(self.quote_identifiers(columns))
+
         clauses = []
         params = []
-        if codes:
-            code_list = [codes] if isinstance(codes, str) else codes
+        if codes is not None:
+            code_list = [codes] if isinstance(codes, str) else list(codes)
             clauses.append(f"code IN ({', '.join(['?'] * len(code_list))})")
             params.extend(code_list)
-        if start_date:
+        if start_date is not None:
             clauses.append("date >= ?")
-            params.append(start_date)
-        if end_date:
+            params.append(pd.to_datetime(start_date).date())
+        if end_date is not None:
             clauses.append("date <= ?")
-            params.append(end_date)
+            params.append(pd.to_datetime(end_date).date())
+        if drop_all_null and factor_cols:
+            null_clause = " OR ".join(
+                f"{self.quote_identifier(col)} IS NOT NULL"
+                for col in factor_cols
+            )
+            clauses.append(f"({null_clause})")
+
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit_sql = f"LIMIT {int(limit)}" if limit else ""
-        return self.con.execute(
+        limit_sql = f"LIMIT {int(limit)}" if limit is not None else ""
+        table = self.quote_identifier(table_name)
+
+        return self.df(
             f"""
-            SELECT {", ".join(f'"{col}"' for col in columns)}
-            FROM "{table_name}"
+            SELECT {select_sql}
+            FROM {table}
             {where_sql}
             ORDER BY date, code
             {limit_sql}
             """,
             params,
-        ).df()
+        )
 
+    def query_wide(
+        self,
+        table_name: str,
+        factor: str,
+        *,
+        codes: str | list[str] | None = None,
+        start_date: str | datetime.date | None = None,
+        end_date: str | datetime.date | None = None,
+    ) -> pd.DataFrame:
+        """Query one factor as a date-by-code matrix."""
+        df = self.query(
+            table_name,
+            factors=factor,
+            codes=codes,
+            start_date=start_date,
+            end_date=end_date,
+            drop_all_null=True,
+        )
 
-    def begin(self) -> None:
-        """开始事务"""
-        self.con.execute("BEGIN")
+        if df.empty:
+            return pd.DataFrame()
 
+        return (
+            df.pivot(index="date", columns="code", values=factor)
+            .sort_index()
+            .sort_index(axis=1)
+        )
 
-    def commit(self) -> None:
-        """提交事务"""
-        self.con.execute("COMMIT")
+    def delete_rows(
+        self,
+        table_name: str,
+        *,
+        codes: str | list[str] | None = None,
+        start_date: str | datetime.date | None = None,
+        end_date: str | datetime.date | None = None,
+    ) -> None:
+        """Delete rows from a factor table. At least one filter is required."""
+        clauses = []
+        params = []
+        if codes is not None:
+            code_list = [codes] if isinstance(codes, str) else list(codes)
+            clauses.append(f"code IN ({', '.join(['?'] * len(code_list))})")
+            params.extend(code_list)
+        if start_date is not None:
+            clauses.append("date >= ?")
+            params.append(pd.to_datetime(start_date).date())
+        if end_date is not None:
+            clauses.append("date <= ?")
+            params.append(pd.to_datetime(end_date).date())
+        if not clauses:
+            raise ValueError("delete_rows requires at least one filter")
 
+        table = self.quote_identifier(table_name)
+        self.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE {' AND '.join(clauses)}
+            """,
+            params,
+        )
 
-    def rollback(self) -> None:
-        """回滚事务"""
-        self.con.execute("ROLLBACK")
+        if self.table_exists(self.universe_table):
+            self.sync_table_universe(table_name)
 
+    def describe_table(self, table_name: str) -> pd.DataFrame:
+        """Return column names, SQL types, and nullability."""
+        return self.df(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'main'
+              AND table_name = ?
+            ORDER BY ordinal_position
+            """,
+            [table_name],
+        )
 
-    def close(self) -> None:
-        self.con.close()
+    def table_stats(self, table_name: str) -> pd.DataFrame:
+        """Return date range and row/code/date counts."""
+        table = self.quote_identifier(table_name)
+        return self.df(
+            f"""
+            SELECT
+                MIN(date) AS start_date,
+                MAX(date) AS end_date,
+                COUNT(*) AS rows,
+                COUNT(DISTINCT date) AS dates,
+                COUNT(DISTINCT code) AS codes
+            FROM {table}
+            """
+        )
 
+    def universe_match_stats(self, table_name: str) -> pd.DataFrame:
+        """Return key mismatch counts between a factor table and ``Universe``."""
+        if not self.table_exists(self.universe_table):
+            raise RuntimeError("Universe table does not exist")
+        if not self.table_exists(table_name):
+            raise RuntimeError(f"table does not exist: {table_name}")
 
-    def __enter__(self) -> None:
-        return self
+        table = self.quote_identifier(table_name)
+        universe_table = self.quote_identifier(self.universe_table)
 
-
-    def __exit__(self, *_) -> None:
-        self.close()
+        return self.df(
+            f"""
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM {universe_table} AS u
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {table} AS t
+                        WHERE t.date = u.date
+                          AND t.code = u.code
+                    )
+                ) AS missing_in_table,
+                (
+                    SELECT COUNT(*)
+                    FROM {table} AS t
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {universe_table} AS u
+                        WHERE u.date = t.date
+                          AND u.code = t.code
+                    )
+                ) AS extra_in_table
+            """
+        )
 
 
 if __name__ == "__main__":
     with FactorDuckDB() as db:
-        print(db._quote_identifier("code"))
-        print(db._quote_identifier('code'))
-        print(db._quote_identifier(""))
-        print(db._quote_identifier(''))
-        
+        pass
